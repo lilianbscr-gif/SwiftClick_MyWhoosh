@@ -10,6 +10,7 @@ from datetime import datetime
 from bleak import BleakClient, BleakScanner
 from pynput.keyboard import Key, Controller
 from logger import EventLogger
+from intervals_client import IntervalsClient
 
 # ── Configuration ────────────────────────────────────────────
 TOUCHE_PLUS  = 'k'
@@ -211,14 +212,22 @@ class App(tk.Tk):
         self._lock    = threading.Lock()
         self._canvas  = [None, None]
         self._connected = [False, False]
-        self._logger  = EventLogger()      # journal structuré → logs/events_*.jsonl
+        self._logger    = EventLogger()
+        self._intervals = IntervalsClient()
 
         # Indicateurs batterie et signal
         self._battery_lbl = [None, None]
         self._rssi_lbl    = [None, None]
 
+        # Labels panneau performance intervals.icu
+        self._perf_lbl: dict[str, tk.Label] = {}
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Premier fetch intervals après 2s puis toutes les 10min
+        if self._intervals.enabled:
+            self.after(2000, self._fetch_intervals)
 
     def _build_ui(self):
         BG  = _C["bg1"]
@@ -308,6 +317,44 @@ class App(tk.Tk):
         tk.Label(bar, textvariable=self._count_var,
                  font=("Consolas", 9, "bold"), fg=I3, bg=BG3
                  ).pack(side="right", padx=10)
+
+        # ── Panneau performance intervals.icu ─────────────────
+        tk.Frame(self, bg=_C["cyand"], height=1).pack(fill="x", padx=PAD)
+        tk.Label(self, text="── PERFORMANCE DU JOUR ──",
+                 font=("Consolas", 7, "bold"), fg=I3, bg=BG
+                 ).pack(anchor="w", padx=PAD, pady=(4, 2))
+
+        pf = tk.Frame(self, bg=BG3)
+        pf.pack(fill="x", padx=PAD, pady=(0, 4))
+
+        rows = [
+            ("FORME",    "ctl", "(CTL)"),
+            ("FATIGUE",  "atl", "(ATL)"),
+            ("BALANCE",  "tsb", "(TSB)"),
+            ("FTP",      "ftp", "W    "),
+        ]
+        for label, key, unit in rows:
+            row = tk.Frame(pf, bg=BG3)
+            row.pack(fill="x", padx=8, pady=1)
+            tk.Label(row, text=f"{label} {unit}",
+                     font=("Consolas", 7), fg=I3, bg=BG3, width=16, anchor="w"
+                     ).pack(side="left")
+            lbl = tk.Label(row, text="—",
+                           font=("Consolas", 8, "bold"), fg=I3, bg=BG3, anchor="w")
+            lbl.pack(side="left")
+            self._perf_lbl[key] = lbl
+
+        foot = tk.Frame(pf, bg=BG3)
+        foot.pack(fill="x", padx=8, pady=(2, 4))
+        self._perf_lbl["updated"] = tk.Label(
+            foot, text="", font=("Consolas", 6), fg=I3, bg=BG3, anchor="w"
+        )
+        self._perf_lbl["updated"].pack(side="left")
+        tk.Button(
+            foot, text="↻", font=("Consolas", 8), fg=_C["cyand"], bg=BG3,
+            bd=0, cursor="hand2", activebackground=BG3, activeforeground=_C["cyan"],
+            command=self._fetch_intervals
+        ).pack(side="right")
 
         # ── Journal ───────────────────────────────────────────
         tk.Label(self, text="── JOURNAL SYSTÈME ──",
@@ -626,6 +673,75 @@ class App(tk.Tk):
         self._count += 1
         self._count_var.set(f"{self._count:04d}×")
         self._last_lbl.configure(text=label, fg=_C["cyan"])
+
+    # ── intervals.icu ─────────────────────────────────────────
+    def _fetch_intervals(self):
+        """Lance le fetch en thread pour ne pas bloquer l'UI."""
+        threading.Thread(target=self._do_fetch_intervals, daemon=True).start()
+
+    def _do_fetch_intervals(self):
+        data = self._intervals.fetch_all()
+        self._ui(self._update_perf, data)
+        # Replanifie dans 10 minutes
+        self._ui(lambda: self.after(600_000, self._fetch_intervals))
+
+    def _update_perf(self, data: dict):
+        """Met à jour les labels du panneau performance (thread UI)."""
+        if not self._perf_lbl:
+            return
+
+        def bar(val, scale=100):
+            if val is None:
+                return "—"
+            filled = min(5, max(0, round(val / (scale / 5))))
+            return "▰" * filled + "▱" * (5 - filled)
+
+        def tsb_color(tsb):
+            if tsb is None:  return _C["ice3"]
+            if tsb >   5:    return _C["cyan"]
+            if tsb > -10:    return _C["cyand"]
+            if tsb > -30:    return _C["ora"]
+            return _C["red"]
+
+        def tsb_label(tsb):
+            if tsb is None:  return "—"
+            if tsb >   5:    return f"+{tsb:.1f}  EN FORME"
+            if tsb > -10:    return f"{tsb:.1f}  EQUILIBRE"
+            if tsb > -30:    return f"{tsb:.1f}  FATIGUE"
+            return               f"{tsb:.1f}  SURCHARGE"
+
+        ctl = data.get("ctl")
+        atl = data.get("atl")
+        tsb = data.get("tsb")
+        ftp = data.get("ftp")
+
+        # CTL
+        lbl = self._perf_lbl.get("ctl")
+        if lbl:
+            txt = f"{bar(ctl, 80)}  {ctl:.1f}" if ctl is not None else "—"
+            lbl.configure(text=txt, fg=_C["cyan"] if ctl else _C["ice3"])
+
+        # ATL
+        lbl = self._perf_lbl.get("atl")
+        if lbl:
+            txt = f"{bar(atl, 80)}  {atl:.1f}" if atl is not None else "—"
+            lbl.configure(text=txt, fg=_C["ora"] if atl else _C["ice3"])
+
+        # TSB
+        lbl = self._perf_lbl.get("tsb")
+        if lbl:
+            lbl.configure(text=tsb_label(tsb), fg=tsb_color(tsb))
+
+        # FTP
+        lbl = self._perf_lbl.get("ftp")
+        if lbl:
+            txt = f"{ftp} W" if ftp else "— W  (calcul en cours)"
+            lbl.configure(text=txt, fg=_C["cyan"] if ftp else _C["ice3"])
+
+        # Horodatage
+        lbl = self._perf_lbl.get("updated")
+        if lbl:
+            lbl.configure(text=f"MàJ {datetime.now().strftime('%H:%M')}", fg=_C["ice3"])
 
     # ── UI helpers ────────────────────────────────────────────
     def _refresh_canvas(self, idx, connected, status_text):
