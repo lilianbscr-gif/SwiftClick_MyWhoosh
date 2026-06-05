@@ -32,3 +32,8 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec.bak
