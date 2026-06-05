@@ -51,9 +51,9 @@ _C = {
     "cyand": "#005f77",   # cyan atténué
     "cyang": "#001d25",   # cyan très dim (glow bg)
     "blue":  "#0077ee",   # accent secondaire
-    "ice":   "#cce8ff",   # texte brillant
-    "ice2":  "#5a8aaa",   # texte moyen
-    "ice3":  "#1a3550",   # texte dim
+    "ice":   "#e0f4ff",   # texte brillant (blanc glacé)
+    "ice2":  "#9ec8e8",   # texte moyen (bleu clair)
+    "ice3":  "#6a9abf",   # texte dim (gris-bleu lisible)
     "green": "#00ffcc",   # succès
     "red":   "#ff1a44",   # erreur / stop
     "pink":  "#ff3366",   # bouton MOINS connecté
