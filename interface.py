@@ -4,7 +4,7 @@ Double-cliquez sur Lancer.bat pour démarrer.
 Prérequis : pip install bleak pynput
 """
 
-import asyncio, threading, time, tkinter as tk
+import asyncio, threading, time, tkinter as tk, subprocess
 from tkinter import scrolledtext
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
@@ -224,6 +224,9 @@ class App(tk.Tk):
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Lancement automatique de MyWhoosh au démarrage
+        self.after(500, self._launch_mywhoosh)
 
         # Premier fetch intervals après 2s puis toutes les 10min
         if self._intervals.enabled:
@@ -673,6 +676,16 @@ class App(tk.Tk):
         self._count += 1
         self._count_var.set(f"{self._count:04d}×")
         self._last_lbl.configure(text=label, fg=_C["cyan"])
+
+    # ── MyWhoosh auto-launch ──────────────────────────────────
+    def _launch_mywhoosh(self):
+        """Lance MyWhoosh (app Windows Store) si pas déjà ouvert."""
+        app_id = "MyWhooshTechnologyService.644173E064ED2_eps1123pz0kt0!MYWHOOSH"
+        try:
+            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+            self._log("MyWhoosh lancé automatiquement", "ok")
+        except Exception as e:
+            self._log(f"Impossible de lancer MyWhoosh : {e}", "err")
 
     # ── intervals.icu ─────────────────────────────────────────
     def _fetch_intervals(self):
