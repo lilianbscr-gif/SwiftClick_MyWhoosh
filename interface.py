@@ -1,14 +1,27 @@
 """
-interface.py  —  Zwift Click V2 → MyWhoosh
+interface.py  —  Zwift Click V2 → MyWhoosh  (PySide6 + qasync)
 Double-cliquez sur Lancer.bat pour démarrer.
-Prérequis : pip install bleak pynput
+Prérequis : pip install bleak pynput PySide6 qasync
 """
 
-import asyncio, threading, time, tkinter as tk, subprocess
-from tkinter import scrolledtext
-from datetime import datetime
+import asyncio, time, subprocess, json, os, sys, threading
+from datetime import datetime, timedelta
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QFrame, QPlainTextEdit,
+)
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+from PySide6.QtGui import (
+    QPainter, QColor, QPen, QBrush, QFont, QPainterPath,
+    QLinearGradient, QRadialGradient, QTextCharFormat, QTextCursor,
+    QIcon,
+)
+
+import qasync
+
 from bleak import BleakClient, BleakScanner
-from pynput.keyboard import Key, Controller
+from pynput.keyboard import Controller
 from logger import EventLogger
 from intervals_client import IntervalsClient
 
@@ -16,23 +29,21 @@ from intervals_client import IntervalsClient
 TOUCHE_PLUS  = 'k'
 TOUCHE_MOINS = 'i'
 
-# Détection bouton par masque BLE (comme bikecontrol/OpenBikeControl) :
-#   0xDF = bit 5 de data[3] = bit 12 du buttonMap = SHFT_UP_R = bouton PLUS
-#   0xFD = bit 1 de data[3] = bit 8  du buttonMap = SHFT_UP_L = bouton MINUS
-# Mapping par MASQUE, jamais par idx — cohérent avec le protocole Zwift Click V2.
+DEBOUNCE = 0.05
 
-DEBOUNCE = 0.05   # s — anti-rebond capteur par appareil (50ms)
-
-KEEPALIVE_INTERVAL = 3.0    # s — le device dort après ~5s sans activité, keepalive à 3s
-SILENCE_WARN       = 5.0    # s — alerte visuelle + burst de réveil (pas de déconnexion)
-SILENCE_GRACE      = 20.0   # s — délai avant armement watchdog (connexion + handshake)
-# ─────────────────────────────────────────────────────────────
+KEEPALIVE_INTERVAL = 3.0
+SILENCE_WARN       = 5.0
+SILENCE_GRACE      = 20.0
+LOCK_TIMEOUT       = 55.0
 
 WRITE_UUID   = "00000003-19ca-4651-86e5-fa29dcdd09d1"
 BATTERY_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 RIDEON       = b"RideOn"
+UNLOCK_CMD   = bytes([0xFF, 0x04, 0x00])
 ZWIFT_MFR    = 0x094A
-NOTIF_UUIDS  = [
+
+UNLOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unlock_state.json")
+NOTIF_UUIDS = [
     "00000002-19ca-4651-86e5-fa29dcdd09d1",
     "00000100-19ca-4651-86e5-fa29dcdd09d1",
     "00000101-19ca-4651-86e5-fa29dcdd09d1",
@@ -41,24 +52,56 @@ NOTIF_UUIDS  = [
 
 keyboard = Controller()
 
-# ── Palette futuriste — couleurs froides ──────────────────────
+# ── Palette futuriste ────────────────────────────────────────
 _C = {
-    "bg0":   "#020810",   # fond profond (quasi-noir bleuté)
-    "bg1":   "#05101e",   # fond fenêtre
-    "bg2":   "#081828",   # panneau / section
-    "bg3":   "#0c2038",   # surface élevée
-    "cyan":  "#00d4ff",   # néon primaire
-    "cyand": "#005f77",   # cyan atténué
-    "cyang": "#001d25",   # cyan très dim (glow bg)
-    "blue":  "#0077ee",   # accent secondaire
-    "ice":   "#e0f4ff",   # texte brillant (blanc glacé)
-    "ice2":  "#9ec8e8",   # texte moyen (bleu clair)
-    "ice3":  "#6a9abf",   # texte dim (gris-bleu lisible)
-    "green": "#00ffcc",   # succès
-    "red":   "#ff1a44",   # erreur / stop
-    "pink":  "#ff3366",   # bouton MOINS connecté
-    "ora":   "#ff8c00",   # alerte
+    "bg0":   "#020810",
+    "bg1":   "#05101e",
+    "bg2":   "#081828",
+    "bg3":   "#0c2038",
+    "cyan":  "#00d4ff",
+    "cyand": "#005f77",
+    "cyang": "#001d25",
+    "blue":  "#0077ee",
+    "ice":   "#e0f4ff",
+    "ice2":  "#9ec8e8",
+    "ice3":  "#6a9abf",
+    "green": "#00ffcc",
+    "red":   "#ff1a44",
+    "pink":  "#ff3366",
+    "ora":   "#ff8c00",
 }
+
+
+# ── Helpers persistance unlock 24h ───────────────────────────
+
+def _load_unlock_state() -> dict:
+    try:
+        with open(UNLOCK_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_unlock_timestamp(device_addr: str):
+    state = _load_unlock_state()
+    state[device_addr.upper()] = datetime.now().isoformat()
+    try:
+        with open(UNLOCK_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def is_device_unlocked_24h(device_addr: str) -> bool:
+    state = _load_unlock_state()
+    ts_str = state.get(device_addr.upper())
+    if not ts_str:
+        return False
+    try:
+        last_unlock = datetime.fromisoformat(ts_str)
+        return datetime.now() - last_unlock < timedelta(hours=24)
+    except Exception:
+        return False
 
 
 def est_click(device, adv):
@@ -68,19 +111,8 @@ def est_click(device, adv):
 
 
 def detect_key(data: bytearray) -> str | None:
-    """Décode les trames BLE du Zwift Click sur UUID 00000002 (après activation RideOn).
-
-    Format A — data[0]=0x23, bitmask en data[3] (seul format actif après RideOn) :
-      mask=0xFF           → idle toutes les ~90 ms, ignoré
-      bit 5 (0x20) à 0   → bouton +   (mask ex. 0xDF)
-      bit 1 (0x02) à 0   → bouton −   (mask ex. 0xFD)
-      Confirmé diagnostic : bouton minus envoie 23 08 ff fd ff ff 0f
-
-    Autres paquets sur 00000002 (19 10 50 etc.) : data[0]≠0x23 → ignorés.
-    """
     if not data or data[0] != 0x23 or len(data) < 5:
         return None
-
     mask = data[3]
     if mask == 0xFF:
         return None
@@ -92,7 +124,6 @@ def detect_key(data: bytearray) -> str | None:
 
 
 def rssi_quality(rssi: int) -> tuple[str, str, str]:
-    """Retourne (barres, couleur_hex, label) depuis un RSSI en dBm."""
     if rssi >= -60: return "▰▰▰▰▰", _C["cyan"],  "OPTIMAL"
     if rssi >= -70: return "▰▰▰▰▱", _C["cyan"],  "BON"
     if rssi >= -80: return "▰▰▰▱▱", _C["ora"],   "MOYEN"
@@ -106,314 +137,448 @@ def battery_color(pct: int) -> str:
     return _C["red"]
 
 
-# ── Carte device — style octagonal futuriste ─────────────────
-def make_click_canvas(parent, side="plus", connected=False):
-    W, H = 125, 158
-    c = tk.Canvas(parent, width=W, height=H,
-                  bg=_C["bg0"], highlightthickness=0)
+# ── ClickCard — widget QPainter style HUD ────────────────────
 
-    CUT = 18  # découpe des coins pour l'octogone
-    # Sommets de l'octogone
-    pts = [CUT, 0,  W-CUT, 0,  W, CUT,  W, H-CUT,
-           W-CUT, H,  CUT, H,  0, H-CUT,  0, CUT]
+class ClickCard(QWidget):
+    """Carte device Zwift Click V2 — octogone futuriste dessiné avec QPainter."""
 
-    if connected:
-        body   = _C["bg3"]
-        edge   = _C["cyan"]
-        edged  = _C["cyand"]
-        edgeg  = _C["cyang"]
-        lbl_c  = _C["ice2"]
-    else:
-        body   = _C["bg2"]
-        edge   = _C["ice3"]
-        edged  = "#0d1f2e"
-        edgeg  = _C["bg0"]
-        lbl_c  = _C["ice3"]
+    W, H, CUT = 132, 168, 20
 
-    if side == "plus":
-        btn_fill = _C["cyan"]  if connected else _C["ice3"]
-        btn_edge = _C["cyan"]  if connected else _C["ice3"]
-        sym_fill = _C["bg0"]   if connected else _C["bg2"]
-        symbol   = "+"
-        key_lbl  = "SHIFT +"
-    else:
-        btn_fill = _C["pink"]  if connected else "#1a0813"
-        btn_edge = _C["pink"]  if connected else _C["ice3"]
-        sym_fill = "white"     if connected else _C["ice3"]
-        symbol   = "−"
-        key_lbl  = "SHIFT −"
+    def __init__(self, side: str = "plus", parent=None):
+        super().__init__(parent)
+        self.side      = side
+        self.connected = False
+        self.setFixedSize(self.W, self.H)
+        self.setAttribute(Qt.WA_TranslucentBackground)
 
-    # Corps (remplissage + double bordure)
-    c.create_polygon(pts, fill=body,  outline="")
-    c.create_polygon(pts, fill="",    outline=edged, width=1)
-    c.create_polygon(pts, fill="",    outline=edge,  width=2)
+    def set_connected(self, connected: bool):
+        if self.connected != connected:
+            self.connected = connected
+            self.update()
 
-    # Crochets de coin (effet HUD)
-    blen = 12
-    for (x1c, y1c, x2c, y2c, x3c, y3c) in [
-        (0, CUT+blen, 0, CUT, blen, CUT),
-        (W-blen, CUT, W, CUT, W, CUT+blen),
-        (0, H-CUT-blen, 0, H-CUT, blen, H-CUT),
-        (W-blen, H-CUT, W, H-CUT, W, H-CUT-blen),
-    ]:
-        c.create_line(x1c, y1c, x2c, y2c, x3c, y3c,
-                      fill=edge, width=2)
+    def _octagon_path(self) -> QPainterPath:
+        W, H, C = self.W, self.H, self.CUT
+        p = QPainterPath()
+        p.moveTo(C, 0)
+        p.lineTo(W - C, 0)
+        p.lineTo(W, C)
+        p.lineTo(W, H - C)
+        p.lineTo(W - C, H)
+        p.lineTo(C, H)
+        p.lineTo(0, H - C)
+        p.lineTo(0, C)
+        p.closeSubpath()
+        return p
 
-    # Ligne séparatrice haute
-    c.create_line(CUT, 26, W-CUT, 26, fill=edged, width=1)
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
 
-    # Bouton principal
-    bx, by = W // 2, 72
-    R = 28
-    # Anneau de glow (simulé avec plusieurs cercles de plus en plus dim)
-    if connected:
-        c.create_oval(bx-R-6, by-R-6, bx+R+6, by+R+6,
-                      fill=edgeg, outline="")
-        c.create_oval(bx-R-3, by-R-3, bx+R+3, by+R+3,
-                      fill="", outline=edged, width=1)
-    # Bouton
-    c.create_oval(bx-R, by-R, bx+R, by+R,
-                  fill=btn_fill, outline=btn_edge, width=2)
-    c.create_text(bx, by, text=symbol,
-                  font=("Segoe UI", 26, "bold"), fill=sym_fill)
+        W, H, C = self.W, self.H, self.CUT
+        conn = self.connected
 
-    # Ligne séparatrice basse
-    c.create_line(CUT, H-38, W-CUT, H-38, fill=edged, width=1)
+        accent     = QColor(_C["cyan"]) if self.side == "plus" else QColor(_C["pink"])
+        accent_dim = QColor(_C["cyand"]) if self.side == "plus" else QColor("#3d0018")
 
-    # LED + glow
-    lx, ly = W // 2, H - 26
-    if connected:
-        c.create_oval(lx-8, ly-8, lx+8, ly+8, fill=edgeg, outline="")
-    c.create_oval(lx-4, ly-4, lx+4, ly+4,
-                  fill=edge if connected else edged, outline="")
+        path = self._octagon_path()
 
-    # Étiquette
-    c.create_text(W // 2, H - 10, text=key_lbl,
-                  font=("Consolas", 7, "bold"), fill=lbl_c)
+        # ── Corps avec dégradé ────────────────────────────────
+        grad = QLinearGradient(QPointF(0, 0), QPointF(0, H))
+        if conn:
+            grad.setColorAt(0, QColor("#0f2840"))
+            grad.setColorAt(1, QColor("#07182a"))
+        else:
+            grad.setColorAt(0, QColor("#081828"))
+            grad.setColorAt(1, QColor("#04101c"))
+        p.setPen(Qt.NoPen)
+        p.fillPath(path, QBrush(grad))
 
-    return c
+        # Glow de fond quand connecté
+        if conn:
+            glow = QColor(accent)
+            glow.setAlpha(12)
+            p.fillPath(path, QBrush(glow))
 
+        # ── Bordure double ────────────────────────────────────
+        p.setPen(QPen(accent_dim, 1))
+        p.drawPath(path)
+        border_color = QColor(accent) if conn else QColor("#2a4060")
+        p.setPen(QPen(border_color, 2))
+        p.drawPath(path)
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Zwift Click V2 → MyWhoosh")
-        self.resizable(False, False)
-        self.configure(bg=_C["bg1"])
+        # ── Crochets HUD ──────────────────────────────────────
+        blen = 14
+        bracket_color = QColor(accent) if conn else QColor("#1e3550")
+        p.setPen(QPen(bracket_color, 2, Qt.SolidLine, Qt.SquareCap))
+        corners = [
+            [(0, C + blen), (0, C), (blen, C)],
+            [(W - blen, C), (W, C), (W, C + blen)],
+            [(0, H - C - blen), (0, H - C), (blen, H - C)],
+            [(W - blen, H - C), (W, H - C), (W, H - C - blen)],
+        ]
+        for pts in corners:
+            for i in range(len(pts) - 1):
+                p.drawLine(QPointF(*pts[i]), QPointF(*pts[i + 1]))
 
-        self._loop    = None
-        self._thread  = None
-        self._running = False
-        self._btn_pressed    = [False, False]  # état bouton par appareil (machine à états)
-        self._last_fire      = [0.0,   0.0]   # horodatage du dernier tir par appareil
-        self._global_key     = None            # touche globalement active (bikecontrol: _lastButtonsClicked)
-        self._device_addrs   = [None,  None]   # MAC par idx — pour les logs
-        self._count   = 0
-        self._lock    = threading.Lock()
-        self._canvas  = [None, None]
-        self._connected = [False, False]
-        self._logger    = EventLogger()
-        self._intervals = IntervalsClient()
-
-        # Indicateurs batterie et signal
-        self._battery_lbl = [None, None]
-        self._rssi_lbl    = [None, None]
-
-        # Labels panneau performance intervals.icu
-        self._perf_lbl: dict[str, tk.Label] = {}
-
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Lancement automatique de MyWhoosh au démarrage
-        self.after(500, self._launch_mywhoosh)
-
-        # Premier fetch intervals après 2s puis toutes les 10min
-        if self._intervals.enabled:
-            self.after(2000, self._fetch_intervals)
-
-    def _build_ui(self):
-        BG  = _C["bg1"]
-        BG2 = _C["bg2"]
-        BG3 = _C["bg3"]
-        CYN = _C["cyan"]
-        I3  = _C["ice3"]
-        PAD = 12
-
-        # ── En-tête ──────────────────────────────────────────
-        tk.Frame(self, bg=_C["cyand"], height=2).pack(fill="x")
-
-        hdr = tk.Frame(self, bg=BG, pady=6)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="◈  ZWIFT CLICK  ──  MYWHOOSH  ◈",
-                 font=("Consolas", 12, "bold"), fg=CYN, bg=BG
-                 ).pack()
-        tk.Label(hdr, text="SYSTÈME DE CONTRÔLE BLUETOOTH",
-                 font=("Consolas", 7), fg=I3, bg=BG
-                 ).pack()
-
-        tk.Frame(self, bg=_C["cyand"], height=1).pack(fill="x")
-
-        # ── Cartes devices ────────────────────────────────────
-        clicks_frame = tk.Frame(self, bg=BG2, pady=2)
-        clicks_frame.pack(fill="x", padx=PAD, pady=(PAD, 2))
-
-        for col, (side, key) in enumerate(
-                [("plus", TOUCHE_PLUS), ("moins", TOUCHE_MOINS)]):
-            frame = tk.Frame(clicks_frame, bg=BG2)
-            frame.grid(row=0, column=col, padx=14, pady=8)
-
-            cvs = make_click_canvas(frame, side=side, connected=False)
-            cvs.pack()
-            self._canvas[col] = cvs
-
-            tk.Label(frame, text=f"[ {key} ]",
-                     font=("Consolas", 8, "bold"),
-                     fg=_C["cyand"], bg=BG2
-                     ).pack(pady=(3, 0))
-
-            lbl = tk.Label(frame, text="OFFLINE",
-                           font=("Consolas", 7), fg=I3, bg=BG2)
-            lbl.pack()
-            if col == 0: self._status_plus  = lbl
-            else:        self._status_moins = lbl
-
-            info = tk.Frame(frame, bg=BG2)
-            info.pack(fill="x", pady=(2, 0))
-
-            bat = tk.Label(info, text="BAT: —",
-                           font=("Consolas", 7), fg=I3, bg=BG2, anchor="w")
-            bat.pack(side="left", padx=2)
-
-            sig = tk.Label(info, text="SIG: —",
-                           font=("Consolas", 7), fg=I3, bg=BG2, anchor="e")
-            sig.pack(side="right", padx=2)
-
-            self._battery_lbl[col] = bat
-            self._rssi_lbl[col]    = sig
-
-        clicks_frame.columnconfigure(0, weight=1)
-        clicks_frame.columnconfigure(1, weight=1)
+        # ── Séparateurs ───────────────────────────────────────
+        p.setPen(QPen(accent_dim, 1))
+        p.drawLine(QPointF(C, 30), QPointF(W - C, 30))
+        p.drawLine(QPointF(C, H - 42), QPointF(W - C, H - 42))
 
         # ── Bouton principal ──────────────────────────────────
-        tk.Frame(self, bg=_C["cyand"], height=1).pack(fill="x", padx=PAD)
+        cx, cy, R = W / 2.0, 82.0, 32.0
 
-        self._btn = tk.Button(
-            self, text="▶  INITIALISER CONNEXION",
-            font=("Consolas", 10, "bold"),
-            fg=_C["bg0"], bg=CYN,
-            activebackground=_C["cyand"], activeforeground=_C["bg0"],
-            bd=0, padx=16, pady=10,
-            cursor="hand2", command=self._toggle)
-        self._btn.pack(pady=PAD, padx=PAD, fill="x")
+        if conn:
+            for r_off, alpha in [(14, 10), (9, 22), (5, 38)]:
+                ring = QColor(accent)
+                ring.setAlpha(alpha)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(ring))
+                p.drawEllipse(QPointF(cx, cy), R + r_off, R + r_off)
 
-        # ── Barre d'action ────────────────────────────────────
-        bar = tk.Frame(self, bg=BG3, pady=7)
-        bar.pack(fill="x", padx=PAD, pady=(0, PAD))
+        if self.side == "plus":
+            btn_fill = QColor(_C["cyan"]) if conn else QColor("#0d2030")
+        else:
+            btn_fill = QColor(_C["pink"]) if conn else QColor("#180810")
 
-        self._last_lbl = tk.Label(bar, text="STANDBY",
-                                   font=("Consolas", 9, "bold"),
-                                   fg=I3, bg=BG3)
-        self._last_lbl.pack(side="left", padx=10)
+        btn_grad = QRadialGradient(QPointF(cx - R * 0.25, cy - R * 0.3), R * 1.6)
+        if conn:
+            lighter = QColor(btn_fill).lighter(140)
+            btn_grad.setColorAt(0, lighter)
+            btn_grad.setColorAt(1, btn_fill)
+        else:
+            btn_grad.setColorAt(0, btn_fill)
+            btn_grad.setColorAt(1, QColor(btn_fill).darker(130))
 
-        self._count_var = tk.StringVar(value="0000×")
-        tk.Label(bar, textvariable=self._count_var,
-                 font=("Consolas", 9, "bold"), fg=I3, bg=BG3
-                 ).pack(side="right", padx=10)
+        p.setPen(QPen(QColor(accent) if conn else QColor("#1e3550"), 2))
+        p.setBrush(QBrush(btn_grad))
+        p.drawEllipse(QPointF(cx, cy), R, R)
 
-        # ── Panneau performance intervals.icu ─────────────────
-        tk.Frame(self, bg=_C["cyand"], height=1).pack(fill="x", padx=PAD)
-        tk.Label(self, text="── PERFORMANCE DU JOUR ──",
-                 font=("Consolas", 7, "bold"), fg=I3, bg=BG
-                 ).pack(anchor="w", padx=PAD, pady=(4, 2))
+        # Symbole +/−
+        sym = "+" if self.side == "plus" else "−"
+        sym_color = QColor(_C["bg0"]) if conn else QColor("#2a4060")
+        p.setPen(sym_color)
+        font = QFont("Segoe UI", 24, QFont.Bold)
+        p.setFont(font)
+        p.drawText(QRectF(cx - R, cy - R, R * 2, R * 2), Qt.AlignCenter, sym)
 
-        pf = tk.Frame(self, bg=BG3)
-        pf.pack(fill="x", padx=PAD, pady=(0, 4))
+        # ── LED indicateur ────────────────────────────────────
+        lx, ly = W / 2.0, float(H - 24)
 
-        rows = [
-            ("FORME",    "ctl", "(CTL)"),
-            ("FATIGUE",  "atl", "(ATL)"),
-            ("BALANCE",  "tsb", "(TSB)"),
-            ("FTP",      "ftp", "W    "),
-        ]
-        for label, key, unit in rows:
-            row = tk.Frame(pf, bg=BG3)
-            row.pack(fill="x", padx=8, pady=1)
-            tk.Label(row, text=f"{label} {unit}",
-                     font=("Consolas", 7), fg=I3, bg=BG3, width=16, anchor="w"
-                     ).pack(side="left")
-            lbl = tk.Label(row, text="—",
-                           font=("Consolas", 8, "bold"), fg=I3, bg=BG3, anchor="w")
-            lbl.pack(side="left")
-            self._perf_lbl[key] = lbl
+        if conn:
+            led_glow = QRadialGradient(QPointF(lx, ly), 12)
+            g_col = QColor(accent)
+            g_col.setAlpha(140)
+            led_glow.setColorAt(0, QColor(accent))
+            led_glow.setColorAt(0.4, g_col)
+            led_glow.setColorAt(1, Qt.transparent)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(led_glow))
+            p.drawEllipse(QPointF(lx, ly), 12, 12)
 
-        foot = tk.Frame(pf, bg=BG3)
-        foot.pack(fill="x", padx=8, pady=(2, 4))
-        self._perf_lbl["updated"] = tk.Label(
-            foot, text="", font=("Consolas", 6), fg=I3, bg=BG3, anchor="w"
+        led_col = QColor(accent) if conn else QColor("#1a3040")
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(led_col))
+        p.drawEllipse(QPointF(lx, ly), 4.5, 4.5)
+
+        # ── Étiquette touche ──────────────────────────────────
+        lbl_col = QColor(_C["ice2"]) if conn else QColor(_C["ice3"])
+        p.setPen(lbl_col)
+        font_sm = QFont("Consolas", 6, QFont.Bold)
+        p.setFont(font_sm)
+        p.drawText(QRectF(0, H - 16, W, 16), Qt.AlignCenter,
+                   "SHIFT +" if self.side == "plus" else "SHIFT −")
+
+        p.end()
+
+
+# ── Barre de séparation ──────────────────────────────────────
+
+def _sep(parent: QWidget, color: str = _C["cyand"], height: int = 1) -> QFrame:
+    line = QFrame(parent)
+    line.setFixedHeight(height)
+    line.setStyleSheet(f"background-color: {color}; border: none;")
+    return line
+
+
+def _label(text: str, color: str, size: int = 7, bold: bool = False,
+           parent: QWidget = None) -> QLabel:
+    lbl = QLabel(text, parent)
+    w = "bold" if bold else "normal"
+    lbl.setStyleSheet(
+        f"color: {color}; font-family: Consolas; font-size: {size}pt; font-weight: {w};"
+        f" background: transparent;"
+    )
+    return lbl
+
+
+# ── Application principale ───────────────────────────────────
+
+class App(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Zwift Click V2 → MyWhoosh")
+        self.setFixedWidth(400)
+        self.setWindowIcon(QIcon(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.ico")
+        ))
+
+        # ── État interne ──────────────────────────────────────
+        self._running      = False
+        self._ble_task     = None
+        self._btn_pressed  = [False, False]
+        self._last_fire    = [0.0, 0.0]
+        self._global_key   = None
+        self._device_addrs = [None, None]
+        self._count        = 0
+        self._lock         = threading.Lock()
+        self._connected    = [False, False]
+        self._logger       = EventLogger()
+        self._intervals    = IntervalsClient()
+
+        self._cards:       list[ClickCard | None] = [None, None]
+        self._status_lbl:  list[QLabel | None]    = [None, None]
+        self._battery_lbl: list[QLabel | None]    = [None, None]
+        self._rssi_lbl:    list[QLabel | None]    = [None, None]
+        self._perf_lbl:    dict[str, QLabel]      = {}
+
+        self._build_ui()
+
+        # Lancement auto MyWhoosh
+        QTimer.singleShot(500, self._launch_mywhoosh)
+
+        # Premier fetch intervals.icu
+        if self._intervals.enabled:
+            QTimer.singleShot(2000, self._fetch_intervals)
+
+    # ── Construction UI ───────────────────────────────────────
+
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        vbox = QVBoxLayout(root)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+        root.setStyleSheet(f"background-color: {_C['bg1']};")
+
+        # En-tête
+        vbox.addWidget(_sep(root, _C["cyand"], 2))
+        hdr = QWidget()
+        hdr.setStyleSheet(f"background-color: {_C['bg1']};")
+        hdr_v = QVBoxLayout(hdr)
+        hdr_v.setContentsMargins(0, 8, 0, 8)
+        hdr_v.setSpacing(2)
+        hdr_v.addWidget(_label("◈  ZWIFT CLICK  ──  MYWHOOSH  ◈",
+                                _C["cyan"], 11, bold=True), 0, Qt.AlignHCenter)
+        hdr_v.addWidget(_label("SYSTÈME DE CONTRÔLE BLUETOOTH",
+                                _C["ice3"], 7), 0, Qt.AlignHCenter)
+        vbox.addWidget(hdr)
+        vbox.addWidget(_sep(root, _C["cyand"], 1))
+
+        # Cartes devices
+        cards_frame = QWidget()
+        cards_frame.setStyleSheet(f"background-color: {_C['bg2']};")
+        cards_h = QHBoxLayout(cards_frame)
+        cards_h.setContentsMargins(14, 10, 14, 10)
+        cards_h.setSpacing(16)
+
+        for col, (side, key) in enumerate([("plus", TOUCHE_PLUS), ("moins", TOUCHE_MOINS)]):
+            col_w = QWidget()
+            col_w.setStyleSheet(f"background-color: {_C['bg2']};")
+            col_v = QVBoxLayout(col_w)
+            col_v.setContentsMargins(0, 0, 0, 0)
+            col_v.setSpacing(3)
+            col_v.setAlignment(Qt.AlignHCenter)
+
+            card = ClickCard(side)
+            self._cards[col] = card
+            col_v.addWidget(card, 0, Qt.AlignHCenter)
+
+            key_lbl = _label(f"[ {key} ]", _C["cyand"], 7, bold=True)
+            col_v.addWidget(key_lbl, 0, Qt.AlignHCenter)
+
+            status = _label("OFFLINE", _C["ice3"], 7)
+            self._status_lbl[col] = status
+            col_v.addWidget(status, 0, Qt.AlignHCenter)
+
+            info_row = QWidget()
+            info_row.setStyleSheet(f"background-color: {_C['bg2']};")
+            info_h = QHBoxLayout(info_row)
+            info_h.setContentsMargins(0, 0, 0, 0)
+            info_h.setSpacing(4)
+
+            bat = _label("BAT: —", _C["ice3"], 7)
+            sig = _label("SIG: —", _C["ice3"], 7)
+            self._battery_lbl[col] = bat
+            self._rssi_lbl[col]    = sig
+            info_h.addWidget(bat)
+            info_h.addStretch()
+            info_h.addWidget(sig)
+
+            col_v.addWidget(info_row)
+            cards_h.addWidget(col_w)
+
+        vbox.addWidget(cards_frame)
+
+        # Bouton connexion
+        vbox.addWidget(_sep(root, _C["cyand"], 1))
+        self._btn = QPushButton("▶  INITIALISER CONNEXION")
+        self._btn.setCursor(Qt.PointingHandCursor)
+        self._btn.setFixedHeight(44)
+        self._btn.setStyleSheet(self._btn_style(active=False))
+        self._btn.clicked.connect(self._toggle)
+        btn_wrap = QWidget()
+        btn_wrap.setStyleSheet(f"background-color: {_C['bg1']};")
+        bw = QHBoxLayout(btn_wrap)
+        bw.setContentsMargins(12, 10, 12, 10)
+        bw.addWidget(self._btn)
+        vbox.addWidget(btn_wrap)
+
+        # Barre d'action
+        vbox.addWidget(_sep(root, _C["cyand"], 1))
+        bar = QWidget()
+        bar.setStyleSheet(f"background-color: {_C['bg3']};")
+        bar_h = QHBoxLayout(bar)
+        bar_h.setContentsMargins(12, 7, 12, 7)
+
+        self._last_lbl = _label("STANDBY", _C["ice3"], 9, bold=True)
+        self._count_lbl = _label("0000×", _C["ice3"], 9, bold=True)
+        bar_h.addWidget(self._last_lbl)
+        bar_h.addStretch()
+        bar_h.addWidget(self._count_lbl)
+        vbox.addWidget(bar)
+
+        # Panneau intervals.icu
+        vbox.addWidget(_sep(root, _C["cyand"], 1))
+        perf_hdr = QWidget()
+        perf_hdr.setStyleSheet(f"background-color: {_C['bg1']};")
+        ph = QHBoxLayout(perf_hdr)
+        ph.setContentsMargins(12, 4, 12, 2)
+        ph.addWidget(_label("── PERFORMANCE DU JOUR ──", _C["ice3"], 7, bold=True))
+        vbox.addWidget(perf_hdr)
+
+        perf_frame = QWidget()
+        perf_frame.setStyleSheet(f"background-color: {_C['bg3']};")
+        pf_v = QVBoxLayout(perf_frame)
+        pf_v.setContentsMargins(12, 6, 12, 6)
+        pf_v.setSpacing(3)
+
+        for lbl_text, key, unit in [
+            ("FORME",   "ctl", "(CTL)"),
+            ("FATIGUE", "atl", "(ATL)"),
+            ("BALANCE", "tsb", "(TSB)"),
+            ("FTP",     "ftp", "W    "),
+        ]:
+            row = QWidget()
+            row.setStyleSheet(f"background-color: {_C['bg3']};")
+            row_h = QHBoxLayout(row)
+            row_h.setContentsMargins(0, 0, 0, 0)
+            row_h.setSpacing(6)
+            row_h.addWidget(_label(f"{lbl_text} {unit}", _C["ice3"], 7, parent=row),
+                            0, Qt.AlignLeft)
+            val_lbl = _label("—", _C["ice3"], 8, bold=True, parent=row)
+            self._perf_lbl[key] = val_lbl
+            row_h.addWidget(val_lbl, 1, Qt.AlignLeft)
+            pf_v.addWidget(row)
+
+        foot = QWidget()
+        foot.setStyleSheet(f"background-color: {_C['bg3']};")
+        foot_h = QHBoxLayout(foot)
+        foot_h.setContentsMargins(0, 2, 0, 2)
+        upd = _label("", _C["ice3"], 6, parent=foot)
+        self._perf_lbl["updated"] = upd
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedSize(22, 22)
+        refresh_btn.setCursor(Qt.PointingHandCursor)
+        refresh_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {_C['cyand']};"
+            f" font-family: Consolas; font-size: 9pt; border: none; }}"
+            f"QPushButton:hover {{ color: {_C['cyan']}; }}"
         )
-        self._perf_lbl["updated"].pack(side="left")
-        tk.Button(
-            foot, text="↻", font=("Consolas", 8), fg=_C["cyand"], bg=BG3,
-            bd=0, cursor="hand2", activebackground=BG3, activeforeground=_C["cyan"],
-            command=self._fetch_intervals
-        ).pack(side="right")
+        refresh_btn.clicked.connect(self._fetch_intervals)
+        foot_h.addWidget(upd)
+        foot_h.addStretch()
+        foot_h.addWidget(refresh_btn)
+        pf_v.addWidget(foot)
+        vbox.addWidget(perf_frame)
 
-        # ── Journal ───────────────────────────────────────────
-        tk.Label(self, text="── JOURNAL SYSTÈME ──",
-                 font=("Consolas", 7, "bold"), fg=I3, bg=BG
-                 ).pack(anchor="w", padx=PAD, pady=(0, 2))
+        # Journal
+        vbox.addWidget(_sep(root, _C["cyand"], 1))
+        log_hdr = QWidget()
+        log_hdr.setStyleSheet(f"background-color: {_C['bg1']};")
+        lh = QHBoxLayout(log_hdr)
+        lh.setContentsMargins(12, 4, 12, 2)
+        lh.addWidget(_label("── JOURNAL SYSTÈME ──", _C["ice3"], 7, bold=True))
+        vbox.addWidget(log_hdr)
 
-        self._log_box = scrolledtext.ScrolledText(
-            self, height=6, width=52,
-            font=("Consolas", 7),
-            bg=_C["bg0"], fg=I3,
-            insertbackground=CYN,
-            state="disabled", bd=0, relief="flat")
-        self._log_box.pack(padx=PAD, pady=(0, PAD))
-
-        self._log_box.tag_config("ok",  foreground=_C["cyan"])
-        self._log_box.tag_config("err", foreground=_C["red"])
-        self._log_box.tag_config("act", foreground=_C["ora"])
-        self._log_box.tag_config("dim", foreground=_C["ice3"])
-
-        tk.Frame(self, bg=_C["cyand"], height=1).pack(fill="x")
+        self._log_box = QPlainTextEdit()
+        self._log_box.setReadOnly(True)
+        self._log_box.setFixedHeight(130)
+        self._log_box.setStyleSheet(
+            f"QPlainTextEdit {{"
+            f"  background-color: {_C['bg0']};"
+            f"  color: {_C['ice3']};"
+            f"  font-family: Consolas; font-size: 7pt;"
+            f"  border: none;"
+            f"  padding: 4px;"
+            f"}}"
+        )
+        self._log_box.setMaximumBlockCount(300)
+        vbox.addWidget(self._log_box)
+        vbox.addWidget(_sep(root, _C["cyand"], 1))
 
         self._log("SYS INIT  ·  READY", "ok")
 
+    # ── Helpers style ─────────────────────────────────────────
+
+    def _btn_style(self, active: bool) -> str:
+        if active:
+            return (
+                f"QPushButton {{ background-color: {_C['red']}; color: {_C['ice']};"
+                f" font-family: Consolas; font-size: 10pt; font-weight: bold;"
+                f" border: none; border-radius: 4px; }}"
+                f"QPushButton:hover {{ background-color: #cc1133; }}"
+            )
+        return (
+            f"QPushButton {{ background-color: {_C['cyan']}; color: {_C['bg0']};"
+            f" font-family: Consolas; font-size: 10pt; font-weight: bold;"
+            f" border: none; border-radius: 4px; }}"
+            f"QPushButton:hover {{ background-color: #00b8e6; }}"
+        )
+
     # ── Contrôles ─────────────────────────────────────────────
+
     def _toggle(self):
-        if self._running: self._stop()
-        else:             self._start()
+        if self._running:
+            self._stop()
+        else:
+            self._start()
 
     def _start(self):
         self._running = True
-        self._btn.configure(text="■  DÉCONNECTER",
-                             bg=_C["red"], activebackground="#aa0022")
+        self._btn.setText("■  DÉCONNECTER")
+        self._btn.setStyleSheet(self._btn_style(active=True))
         self._log("SCAN BLUETOOTH…", "dim")
-        self._loop   = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
+        self._ble_task = asyncio.ensure_future(self._main())
 
     def _stop(self):
         self._running = False
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        self._btn.configure(text="▶  INITIALISER CONNEXION",
-                             bg=_C["cyan"], activebackground=_C["cyand"])
+        if self._ble_task and not self._ble_task.done():
+            self._ble_task.cancel()
+        self._ble_task = None
+        self._btn.setText("▶  INITIALISER CONNEXION")
+        self._btn.setStyleSheet(self._btn_style(active=False))
         for i in range(2):
-            self._refresh_canvas(i, False, "OFFLINE")
+            self._refresh_card(i, False, "OFFLINE")
             self._clear_device_info(i)
         self._log("SYSTÈME ARRÊTÉ", "dim")
 
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._main())
-        except Exception:
-            pass
+    def closeEvent(self, event):
+        self._stop()
+        event.accept()
 
     # ── BLE ───────────────────────────────────────────────────
+
     async def _main(self):
         tasks     = [None, None]
         addresses = [None, None]
@@ -422,8 +587,10 @@ class App(tk.Tk):
             while self._running:
                 for i in range(2):
                     if tasks[i] is not None and tasks[i].done():
-                        try:   await tasks[i]
-                        except Exception: pass
+                        try:
+                            await tasks[i]
+                        except Exception:
+                            pass
                         tasks[i]     = None
                         addresses[i] = None
 
@@ -434,14 +601,13 @@ class App(tk.Tk):
 
                 try:
                     results = await BleakScanner.discover(timeout=8.0, return_adv=True)
-                    # Garde (device, adv_data) pour avoir le RSSI initial
                     clicks = [
                         (d, adv)
                         for _, (d, adv) in results.items()
                         if est_click(d, adv)
                     ]
                 except Exception as e:
-                    self._ui(self._log, f"Erreur scan : {e}", "err")
+                    self._log(f"Erreur scan : {e}", "err")
                     await asyncio.sleep(3)
                     continue
 
@@ -449,11 +615,11 @@ class App(tk.Tk):
                 available = [(d, adv) for d, adv in clicks if d.address not in used]
 
                 if not available:
-                    self._ui(self._log, "Aucun Click disponible, nouvelle tentative…", "dim")
+                    self._log("Aucun Click disponible, nouvelle tentative…", "dim")
                     await asyncio.sleep(3)
                     continue
 
-                self._ui(self._log, f"{len(available)} Click(s) disponible(s).", "ok")
+                self._log(f"{len(available)} Click(s) disponible(s).", "ok")
                 for i, (dev, adv) in zip(missing, available):
                     if not self._running:
                         break
@@ -469,141 +635,165 @@ class App(tk.Tk):
             await asyncio.gather(*[t for t in tasks if t], return_exceptions=True)
 
     async def _connect(self, device, adv_data, idx):
-        addr       = device.address
-        notif_time = [time.monotonic()]
+        addr  = device.address
+        short = addr[-8:]
 
-        # RSSI capturé au moment du scan
         initial_rssi = getattr(adv_data, "rssi", None)
         if initial_rssi is not None:
-            self._ui(self._update_rssi, idx, initial_rssi)
+            self._update_rssi(idx, initial_rssi)
 
-        ready = [False]   # bloque les données bouton pendant la phase de connexion
-
-        def notif_cb(sender, d, _idx=idx):
-            notif_time[0] = time.monotonic()
-            d_arr = bytearray(d)
-            uuid_short = str(getattr(sender, "uuid", "?"))[:8]
-            self._logger.ble_raw(_idx, uuid_short, d_arr, ready[0])
-            if ready[0]:
-                self._on_data(d_arr, _idx)
+        notif_time    = [time.monotonic()]
+        format_a_time = [time.monotonic()]
 
         self._device_addrs[idx] = addr
-        self._logger.connect(idx, addr)
-        self._ui(self._refresh_canvas, idx, False, "Connexion…")
-        try:
-            async with BleakClient(addr) as client:
-                await asyncio.sleep(0.5)
+        label = "SHIFT +" if idx == 0 else "SHIFT −"
 
-                short = addr[-8:]  # partie unique pour les logs : "03:AC:08" / "3F:1C:7E"
+        while self._running:
+            lock_detected = False
+            ready = [False]
 
-                # UUID 00000004 : le device acquitte chaque keepalive sur 00000003
-                # avec "RideOn" sur 00000004. On souscrit pour mettre à jour notif_time.
-                def keepalive_ack_cb(*_):
-                    notif_time[0] = time.monotonic()
+            def notif_cb(sender, d, _idx=idx):
+                notif_time[0] = time.monotonic()
+                d_arr = bytearray(d)
+                if d_arr and d_arr[0] == 0x23:
+                    format_a_time[0] = time.monotonic()
+                uuid_short = str(getattr(sender, "uuid", "?"))[:8]
+                self._logger.ble_raw(_idx, uuid_short, d_arr, ready[0])
+                if ready[0]:
+                    self._on_data(d_arr, _idx)
 
-                try:
-                    await client.start_notify(
-                        "00000004-19ca-4651-86e5-fa29dcdd09d1", keepalive_ack_cb
-                    )
-                except Exception:
-                    pass
+            self._logger.connect(idx, addr)
+            self._refresh_card(idx, False, "Connexion…")
+            try:
+                async with BleakClient(addr) as client:
+                    await asyncio.sleep(0.5)
 
-                # Activation RideOn
-                try:
-                    await client.write_gatt_char(WRITE_UUID, RIDEON, response=False)
-                except Exception:
-                    pass
+                    def keepalive_ack_cb(*_):
+                        notif_time[0] = time.monotonic()
 
-                souscrit = []
-                for uuid in NOTIF_UUIDS:
                     try:
-                        await client.start_notify(uuid, notif_cb)
-                        souscrit.append(uuid)
+                        await client.start_notify(
+                            "00000004-19ca-4651-86e5-fa29dcdd09d1", keepalive_ack_cb
+                        )
                     except Exception:
                         pass
 
-                if not souscrit:
-                    self._ui(self._refresh_canvas, idx, False, "Erreur notifications")
-                    self._ui(self._log, f"Aucune notif sur {addr} — reconnexion", "err")
-                    return
+                    try:
+                        await client.write_gatt_char(WRITE_UUID, RIDEON, response=False)
+                    except Exception:
+                        pass
 
-                label = "SHIFT +" if idx == 0 else "SHIFT −"
-                self._ui(self._refresh_canvas, idx, True, addr)
-                self._ui(self._log, f"{label} connecté ({addr})", "ok")
+                    try:
+                        await asyncio.sleep(0.1)
+                        await client.write_gatt_char(WRITE_UUID, UNLOCK_CMD, response=False)
+                    except Exception:
+                        pass
 
-                battery = await self._read_battery(client)
-                if battery is not None:
-                    self._ui(self._update_battery, idx, battery)
-                    self._ui(self._log, f"{label} batterie : {battery}%", "dim")
-                else:
-                    self._ui(self._update_battery, idx, None)
-
-                self._btn_pressed[idx] = False
-                self._last_fire[idx]   = 0.0
-                notif_time[0]   = time.monotonic()
-                subscribe_time  = time.monotonic()
-                next_rssi_check = subscribe_time + 5.0
-                ready[0] = True
-                self._logger.ready(idx, addr)
-
-                next_keepalive = time.monotonic() + 2.0  # premier keepalive rapide
-
-                while self._running and client.is_connected:
-                    await asyncio.sleep(0.5)
-                    now     = time.monotonic()
-                    silence = now - notif_time[0]
-                    elapsed = now - subscribe_time
-
-                    # ── Watchdog silence ──────────────────────────────────
-                    # Pas de déconnexion forcée — elle cause plus de bugs qu'elle n'en résout.
-                    # Sur silence > SILENCE_WARN : status orange + burst de réveil RideOn.
-                    # La déconnexion BLE reste gérée par while client.is_connected.
-                    if elapsed > SILENCE_GRACE:
-                        if silence > SILENCE_WARN:
-                            self._logger.led_warn(idx, addr, silence)
-                            self._ui(self._update_status, idx,
-                                     f"LED éteinte ({silence:.0f}s) — tentative réveil",
-                                     "#f5a623")
-                        else:
-                            self._ui(self._update_status, idx,
-                                     f"Connecté  •  {short}", "#4ecca3")
-
-                    # Rafraîchissement RSSI toutes les 5 s
-                    if now >= next_rssi_check:
+                    souscrit = []
+                    for uuid in NOTIF_UUIDS:
                         try:
-                            live_rssi = client.rssi
-                            if live_rssi is not None:
-                                self._ui(self._update_rssi, idx, live_rssi)
+                            await client.start_notify(uuid, notif_cb)
+                            souscrit.append(uuid)
                         except Exception:
                             pass
-                        next_rssi_check = now + 5.0
 
-                    # Keepalive toutes les KEEPALIVE_INTERVAL secondes.
-                    # Le device acquitte chaque write avec "RideOn" sur UUID 00000004.
-                    if now >= next_keepalive:
+                    if not souscrit:
+                        self._refresh_card(idx, False, "Erreur notifications")
+                        self._log(f"Aucune notif sur {addr} — reconnexion", "err")
+                        break
+
+                    self._refresh_card(idx, True, addr)
+                    self._log(f"{label} connecté ({addr})", "ok")
+
+                    battery = await self._read_battery(client)
+                    if battery is not None:
+                        self._update_battery(idx, battery)
+                        self._log(f"{label} batterie : {battery}%", "dim")
+                    else:
+                        self._update_battery(idx, None)
+
+                    self._btn_pressed[idx] = False
+                    self._last_fire[idx]   = 0.0
+                    notif_time[0]          = time.monotonic()
+                    format_a_time[0]       = time.monotonic()
+                    subscribe_time         = time.monotonic()
+                    next_rssi_check        = subscribe_time + 5.0
+                    ready[0]               = True
+                    self._logger.ready(idx, addr)
+
+                    next_keepalive = time.monotonic() + 2.0
+
+                    while self._running and client.is_connected:
+                        await asyncio.sleep(0.5)
+                        now        = time.monotonic()
+                        silence    = now - notif_time[0]
+                        elapsed    = now - subscribe_time
+                        fa_silence = now - format_a_time[0]
+
+                        # Lock 24h Zwift
+                        if elapsed > SILENCE_GRACE and fa_silence > LOCK_TIMEOUT:
+                            lock_detected = True
+                            break
+
+                        # Watchdog silence
+                        if elapsed > SILENCE_GRACE:
+                            if silence > SILENCE_WARN:
+                                self._logger.led_warn(idx, addr, silence)
+                                self._update_status(idx,
+                                    f"LED éteinte ({silence:.0f}s) — réveil…",
+                                    _C["ora"])
+                            else:
+                                self._update_status(idx,
+                                    f"Connecté  •  {short}",
+                                    _C["cyan"])
+
+                        # RSSI toutes les 5s
+                        if now >= next_rssi_check:
+                            try:
+                                live_rssi = client.rssi
+                                if live_rssi is not None:
+                                    self._update_rssi(idx, live_rssi)
+                            except Exception:
+                                pass
+                            next_rssi_check = now + 5.0
+
+                        # Keepalive
+                        if now >= next_keepalive:
+                            try:
+                                await client.write_gatt_char(WRITE_UUID, RIDEON, response=False)
+                            except Exception:
+                                pass
+                            next_keepalive = now + KEEPALIVE_INTERVAL
+
+                    for uuid in souscrit:
                         try:
-                            await client.write_gatt_char(WRITE_UUID, RIDEON, response=False)
+                            await client.stop_notify(uuid)
                         except Exception:
                             pass
-                        next_keepalive = now + KEEPALIVE_INTERVAL
 
-                for uuid in souscrit:
-                    try:   await client.stop_notify(uuid)
-                    except Exception: pass
+                    if lock_detected:
+                        self._logger.disconnect(idx, addr, "lock_24h_reconnect")
+                        self._update_status(idx, "Lock 24h — reconnexion…", _C["ora"])
+                        self._log(f"{label} lock 24h Zwift — reconnexion automatique", "err")
+                        self._clear_device_info(idx)
+                        await asyncio.sleep(2.0)
+                        format_a_time[0] = time.monotonic()
+                        continue
 
-                self._logger.disconnect(idx, addr, "led_sleep_or_stop")
-                self._ui(self._refresh_canvas, idx, False, "Déconnecté")
-                self._ui(self._clear_device_info, idx)
-                self._ui(self._log, f"Déconnecté : {addr}", "dim")
+                    self._logger.disconnect(idx, addr, "led_sleep_or_stop")
+                    self._refresh_card(idx, False, "Déconnecté")
+                    self._clear_device_info(idx)
+                    self._log(f"Déconnecté : {addr}", "dim")
+                    break
 
-        except Exception as e:
-            self._logger.disconnect(idx, addr, f"exception:{type(e).__name__}")
-            self._ui(self._refresh_canvas, idx, False, "Erreur")
-            self._ui(self._clear_device_info, idx)
-            self._ui(self._log, f"Erreur {addr}: {e}", "err")
+            except Exception as e:
+                self._logger.disconnect(idx, addr, f"exception:{type(e).__name__}")
+                self._refresh_card(idx, False, "Erreur")
+                self._clear_device_info(idx)
+                self._log(f"Erreur {addr}: {e}", "err")
+                break
 
     async def _read_battery(self, client: BleakClient) -> int | None:
-        """Lit le niveau de batterie via le Battery Service BLE standard (0x2A19)."""
         try:
             data = await client.read_gatt_char(BATTERY_UUID)
             return int(data[0])
@@ -611,7 +801,6 @@ class App(tk.Tk):
             return None
 
     def _on_data(self, data: bytearray, idx: int):
-        # Format A uniquement (UUID 00000002 après RideOn)
         if not data or data[0] != 0x23 or len(data) < 5:
             return
 
@@ -620,66 +809,58 @@ class App(tk.Tk):
 
         if mask == 0xFF:
             self._btn_pressed[idx] = False
-            # Approche bikecontrol : _global_key se remet à None seulement
-            # quand TOUS les devices ont relâché (not any).
             if not any(self._btn_pressed):
                 self._global_key = None
             self._logger.btn_release(idx, addr)
             return
 
-        # Mapping par masque BLE — protocole bikecontrol/OpenBikeControl :
-        # bit 5 de data[3] = 0 → bit 12 buttonMap = SHFT_UP_R = bouton PLUS
-        # bit 1 de data[3] = 0 → bit 8  buttonMap = SHFT_UP_L = bouton MINUS
         if not (mask & 0x20):
             key = TOUCHE_PLUS
         elif not (mask & 0x02):
             key = TOUCHE_MOINS
         else:
-            return  # masque inconnu
+            return
 
         label = "▲  Vitesse +" if key == TOUCHE_PLUS else "▼  Vitesse −"
 
         with self._lock:
-            # Couche 1 — state machine par device (front montant uniquement)
             if self._btn_pressed[idx]:
                 self._logger.btn_block(idx, "state_machine", mask, addr)
                 return
 
             now = time.monotonic()
 
-            # Couche 2 — debounce par device
             if (now - self._last_fire[idx]) < DEBOUNCE:
                 self._logger.btn_block(idx, "debounce", mask, addr)
                 return
 
-            # Couche 3 — déduplication globale (bikecontrol: _lastButtonsClicked).
-            # Si la MÊME touche est déjà active (tirée par un autre device),
-            # on marque quand même ce device comme pressé (btn_pressed[idx]=True)
-            # pour que la state machine bloque toutes ses notifications suivantes
-            # jusqu'au vrai release (0xFF). Sans ce Set, après 100ms le device
-            # repasserait btn_pressed=False et tirerait à nouveau — c'était le bug.
             if key == self._global_key:
-                self._btn_pressed[idx] = True   # ← crucial : bloque les notifs suivantes
+                self._btn_pressed[idx] = True
                 self._logger.btn_block(idx, "global_dedup", mask, addr)
                 return
 
-            # Fire — nouvelle touche ou reprise après release global
-            self._btn_pressed[idx]   = True
-            self._last_fire[idx]     = now
-            self._global_key         = key
+            self._btn_pressed[idx] = True
+            self._last_fire[idx]   = now
+            self._global_key       = key
+            if addr != "?" and not is_device_unlocked_24h(addr):
+                _save_unlock_timestamp(addr)
             self._logger.btn_fire(idx, key, label, mask, addr)
             keyboard.type(key)
 
-        self._ui(self._fire_action, label)
+        self._fire_action(label)
 
-    def _fire_action(self, label):
+    def _fire_action(self, label: str):
         self._count += 1
-        self._count_var.set(f"{self._count:04d}×")
-        self._last_lbl.configure(text=label, fg=_C["cyan"])
+        self._count_lbl.setText(f"{self._count:04d}×")
+        self._last_lbl.setText(label)
+        self._last_lbl.setStyleSheet(
+            f"color: {_C['cyan']}; font-family: Consolas; font-size: 9pt;"
+            f" font-weight: bold; background: transparent;"
+        )
 
-    # ── MyWhoosh auto-launch ──────────────────────────────────
+    # ── MyWhoosh ──────────────────────────────────────────────
+
     def _launch_mywhoosh(self):
-        """Lance MyWhoosh (app Windows Store) si pas déjà ouvert."""
         app_id = "MyWhooshTechnologyService.644173E064ED2_eps1123pz0kt0!MYWHOOSH"
         try:
             subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
@@ -688,18 +869,17 @@ class App(tk.Tk):
             self._log(f"Impossible de lancer MyWhoosh : {e}", "err")
 
     # ── intervals.icu ─────────────────────────────────────────
-    def _fetch_intervals(self):
-        """Lance le fetch en thread pour ne pas bloquer l'UI."""
-        threading.Thread(target=self._do_fetch_intervals, daemon=True).start()
 
-    def _do_fetch_intervals(self):
-        data = self._intervals.fetch_all()
-        self._ui(self._update_perf, data)
-        # Replanifie dans 10 minutes
-        self._ui(lambda: self.after(600_000, self._fetch_intervals))
+    def _fetch_intervals(self):
+        asyncio.ensure_future(self._fetch_intervals_coro())
+
+    async def _fetch_intervals_coro(self):
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, self._intervals.fetch_all)
+        self._update_perf(data)
+        QTimer.singleShot(600_000, self._fetch_intervals)
 
     def _update_perf(self, data: dict):
-        """Met à jour les labels du panneau performance (thread UI)."""
         if not self._perf_lbl:
             return
 
@@ -728,95 +908,133 @@ class App(tk.Tk):
         tsb = data.get("tsb")
         ftp = data.get("ftp")
 
-        # CTL
-        lbl = self._perf_lbl.get("ctl")
-        if lbl:
-            txt = f"{bar(ctl, 80)}  {ctl:.1f}" if ctl is not None else "—"
-            lbl.configure(text=txt, fg=_C["cyan"] if ctl else _C["ice3"])
+        def _set(key, text, color):
+            lbl = self._perf_lbl.get(key)
+            if lbl:
+                lbl.setText(text)
+                lbl.setStyleSheet(
+                    f"color: {color}; font-family: Consolas; font-size: 8pt;"
+                    f" font-weight: bold; background: transparent;"
+                )
 
-        # ATL
-        lbl = self._perf_lbl.get("atl")
-        if lbl:
-            txt = f"{bar(atl, 80)}  {atl:.1f}" if atl is not None else "—"
-            lbl.configure(text=txt, fg=_C["ora"] if atl else _C["ice3"])
+        _set("ctl",
+             f"{bar(ctl, 80)}  {ctl:.1f}" if ctl is not None else "—",
+             _C["cyan"] if ctl else _C["ice3"])
+        _set("atl",
+             f"{bar(atl, 80)}  {atl:.1f}" if atl is not None else "—",
+             _C["ora"] if atl else _C["ice3"])
+        _set("tsb", tsb_label(tsb), tsb_color(tsb))
+        _set("ftp",
+             f"{ftp} W" if ftp else "— W  (calcul en cours)",
+             _C["cyan"] if ftp else _C["ice3"])
 
-        # TSB
-        lbl = self._perf_lbl.get("tsb")
-        if lbl:
-            lbl.configure(text=tsb_label(tsb), fg=tsb_color(tsb))
-
-        # FTP
-        lbl = self._perf_lbl.get("ftp")
-        if lbl:
-            txt = f"{ftp} W" if ftp else "— W  (calcul en cours)"
-            lbl.configure(text=txt, fg=_C["cyan"] if ftp else _C["ice3"])
-
-        # Horodatage
-        lbl = self._perf_lbl.get("updated")
-        if lbl:
-            lbl.configure(text=f"MàJ {datetime.now().strftime('%H:%M')}", fg=_C["ice3"])
+        upd = self._perf_lbl.get("updated")
+        if upd:
+            upd.setText(f"MàJ {datetime.now().strftime('%H:%M')}")
+            upd.setStyleSheet(
+                f"color: {_C['ice3']}; font-family: Consolas; font-size: 6pt;"
+                f" background: transparent;"
+            )
 
     # ── UI helpers ────────────────────────────────────────────
-    def _refresh_canvas(self, idx, connected, status_text):
-        side = "plus" if idx == 0 else "moins"
-        cvs  = self._canvas[idx]
-        parent = cvs.master
 
-        cvs.destroy()
-        new_cvs = make_click_canvas(parent, side=side, connected=connected)
-        new_cvs.pack()
-        self._canvas[idx] = new_cvs
+    def _refresh_card(self, idx: int, connected: bool, status_text: str):
+        if self._cards[idx]:
+            self._cards[idx].set_connected(connected)
+        lbl = self._status_lbl[idx]
+        if lbl:
+            color = _C["cyan"] if connected else _C["ice3"]
+            lbl.setText(status_text)
+            lbl.setStyleSheet(
+                f"color: {color}; font-family: Consolas; font-size: 7pt;"
+                f" background: transparent;"
+            )
 
-        lbl   = self._status_plus if idx == 0 else self._status_moins
-        color = _C["cyan"] if connected else _C["ice3"]
-        lbl.configure(text=status_text, fg=color)
+    def _update_status(self, idx: int, text: str, color: str):
+        lbl = self._status_lbl[idx]
+        if lbl:
+            lbl.setText(text)
+            lbl.setStyleSheet(
+                f"color: {color}; font-family: Consolas; font-size: 7pt;"
+                f" background: transparent;"
+            )
 
     def _update_battery(self, idx: int, pct: int | None):
-        """Met à jour l'étiquette de batterie pour le Click idx."""
         lbl = self._battery_lbl[idx]
+        if not lbl:
+            return
         if pct is None:
-            lbl.configure(text="BAT: —", fg=_C["ice3"])
+            lbl.setText("BAT: —")
+            lbl.setStyleSheet(
+                f"color: {_C['ice3']}; font-family: Consolas; font-size: 7pt;"
+                f" background: transparent;"
+            )
         else:
             color  = battery_color(pct)
             filled = round(pct / 20)
             bar    = "▰" * filled + "▱" * (5 - filled)
-            lbl.configure(text=f"▸{bar} {pct:3d}%", fg=color)
-
-    def _update_status(self, idx: int, text: str, color: str):
-        """Met à jour uniquement le label de statut (sans redessiner le canvas)."""
-        lbl = self._status_plus if idx == 0 else self._status_moins
-        lbl.configure(text=text, fg=color)
+            lbl.setText(f"▸{bar} {pct:3d}%")
+            lbl.setStyleSheet(
+                f"color: {color}; font-family: Consolas; font-size: 7pt;"
+                f" background: transparent;"
+            )
 
     def _update_rssi(self, idx: int, rssi: int):
-        """Met à jour l'étiquette de signal pour le Click idx."""
         lbl = self._rssi_lbl[idx]
+        if not lbl:
+            return
         bars, color, _ = rssi_quality(rssi)
-        lbl.configure(text=f"◈{bars}", fg=color)
+        lbl.setText(f"◈{bars}")
+        lbl.setStyleSheet(
+            f"color: {color}; font-family: Consolas; font-size: 7pt;"
+            f" background: transparent;"
+        )
 
     def _clear_device_info(self, idx: int):
-        """Remet batterie, signal et état bouton à zéro (déconnexion ou arrêt)."""
-        self._btn_pressed[idx]   = False
-        self._last_fire[idx]     = 0.0
+        self._btn_pressed[idx] = False
+        self._last_fire[idx]   = 0.0
         if not any(self._btn_pressed):
             self._global_key = None
-        self._battery_lbl[idx].configure(text="BAT: —",  fg=_C["ice3"])
-        self._rssi_lbl[idx].configure(   text="SIG: —",  fg=_C["ice3"])
+        _dim = f"color: {_C['ice3']}; font-family: Consolas; font-size: 7pt; background: transparent;"
+        if self._battery_lbl[idx]:
+            self._battery_lbl[idx].setText("BAT: —")
+            self._battery_lbl[idx].setStyleSheet(_dim)
+        if self._rssi_lbl[idx]:
+            self._rssi_lbl[idx].setText("SIG: —")
+            self._rssi_lbl[idx].setStyleSheet(_dim)
 
-    def _log(self, msg, tag="dim"):
-        now = datetime.now().strftime("%H:%M:%S")
-        self._log_box.configure(state="normal")
-        self._log_box.insert("end", f"[{now}] {msg}\n", tag)
-        self._log_box.see("end")
-        self._log_box.configure(state="disabled")
+    def _log(self, msg: str, tag: str = "dim"):
+        colors = {
+            "ok":  _C["cyan"],
+            "err": _C["red"],
+            "act": _C["ora"],
+            "dim": _C["ice3"],
+        }
+        color = colors.get(tag, _C["ice3"])
+        ts    = datetime.now().strftime("%H:%M:%S")
 
-    def _ui(self, fn, *args, **kwargs):
-        self.after(0, fn, *args, **kwargs)
+        cursor = self._log_box.textCursor()
+        cursor.movePosition(QTextCursor.End)
 
-    def _on_close(self):
-        self._stop()
-        self.destroy()
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor.insertText(f"[{ts}] {msg}\n", fmt)
 
+        self._log_box.setTextCursor(cursor)
+        self._log_box.ensureCursorVisible()
+
+
+# ── Point d'entrée ────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
+    window = App()
+    window.show()
+
+    with loop:
+        loop.run_forever()

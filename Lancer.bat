@@ -1,7 +1,7 @@
 @echo off
 title Zwift Click → MyWhoosh
 echo Installation des dependances si necessaire...
-pip install bleak pynput --quiet
+pip install bleak pynput PySide6 qasync --quiet
 if errorlevel 1 (
     echo.
     echo Impossible d'installer les dependances.
