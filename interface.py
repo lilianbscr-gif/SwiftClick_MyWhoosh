@@ -34,7 +34,11 @@ DEBOUNCE = 0.05
 KEEPALIVE_INTERVAL = 3.0
 SILENCE_WARN       = 5.0
 SILENCE_GRACE      = 20.0
-LOCK_TIMEOUT       = 55.0
+# Reconnexion lock 24h Zwift :
+#   SESSION_TIMEOUT : proactif — reconnexion avant la fenêtre ~60s (log : lock à ~50s)
+#   LOCK_TIMEOUT    : réactif — Format A vu puis silence → lock actif
+SESSION_TIMEOUT    = 52.0
+LOCK_TIMEOUT       = 12.0
 
 WRITE_UUID   = "00000003-19ca-4651-86e5-fa29dcdd09d1"
 BATTERY_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
@@ -650,13 +654,16 @@ class App(QMainWindow):
 
         while self._running:
             lock_detected = False
-            ready = [False]
+            lock_reason   = "proactive"
+            ready         = [False]
+            had_format_a  = [False]  # True dès qu'un 0x23 reçu dans cette session
 
             def notif_cb(sender, d, _idx=idx):
                 notif_time[0] = time.monotonic()
                 d_arr = bytearray(d)
                 if d_arr and d_arr[0] == 0x23:
                     format_a_time[0] = time.monotonic()
+                    had_format_a[0]  = True
                 uuid_short = str(getattr(sender, "uuid", "?"))[:8]
                 self._logger.ble_raw(_idx, uuid_short, d_arr, ready[0])
                 if ready[0]:
@@ -730,8 +737,15 @@ class App(QMainWindow):
                         elapsed    = now - subscribe_time
                         fa_silence = now - format_a_time[0]
 
-                        # Lock 24h Zwift
-                        if elapsed > SILENCE_GRACE and fa_silence > LOCK_TIMEOUT:
+                        # Proactif : reconnexion juste avant la fenêtre lock ~60s
+                        if elapsed > SESSION_TIMEOUT:
+                            lock_reason   = "session_timeout"
+                            lock_detected = True
+                            break
+
+                        # Réactif : Format A vu puis silencieux → lock actif
+                        if had_format_a[0] and fa_silence > LOCK_TIMEOUT:
+                            lock_reason   = "format_a_silence"
                             lock_detected = True
                             break
 
@@ -772,11 +786,12 @@ class App(QMainWindow):
                             pass
 
                     if lock_detected:
-                        self._logger.disconnect(idx, addr, "lock_24h_reconnect")
+                        self._logger.disconnect(idx, addr, f"lock_24h:{lock_reason}")
                         self._update_status(idx, "Lock 24h — reconnexion…", _C["ora"])
-                        self._log(f"{label} lock 24h Zwift — reconnexion automatique", "err")
+                        suffix = "proactif" if lock_reason == "session_timeout" else "silence Format A"
+                        self._log(f"{label} lock 24h — reconnexion ({suffix})", "err")
                         self._clear_device_info(idx)
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(0.5)
                         format_a_time[0] = time.monotonic()
                         continue
 
